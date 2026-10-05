@@ -41,7 +41,7 @@ curl -fsSL https://raw.githubusercontent.com/phcodesage/wifihop/main/install.sh 
 | `--fails N` | Failed checks (out of the last 5) before switching (default 3) |
 | `--config FILE` | Install your own config file |
 | `--no-start` | Install everything, but don't start the service yet |
-| `--no-authorize` | macOS: skip the one-time password approval (run `sudo wifihop authorize` later) |
+| `--authorize` | macOS, optional: approve keychain access for direct joins (not needed for switching) |
 | `--force` | Install even if no Wi-Fi interface is detected right now |
 | `--uninstall [--purge]` | Remove wifihop (`--purge` also deletes the config) |
 
@@ -76,7 +76,7 @@ wifihop list          # the networks it will try, in order
 wifihop check         # test internet over Wi-Fi once (exit code 0 = online)
 sudo wifihop switch   # hop to the next working network right now
 sudo wifihop diagnose # read-only troubleshooting report, never changes the network
-sudo wifihop authorize # macOS: re-run the one-time password approval
+sudo wifihop authorize # macOS, optional: allow direct joins using saved passwords
 ```
 
 Logs:
@@ -100,7 +100,7 @@ journalctl -u wifihop -f          # Linux
 `prefer` entries in the config always go first.
 
 **Passwords** come from the machine itself:
-- macOS: the System keychain. macOS guards these, so the installer asks once per network: enter your login password and click **Always Allow**. After that the service reads them silently. Re-run with `sudo wifihop authorize` if you add networks later.
+- macOS: wifihop never needs them. To switch, it disconnects from the dead network and lets macOS auto-join another known network. macOS skips the network it just left and uses the passwords it already has. If that lands on another dead network, it repeats, then finally turns Wi-Fi off and on. `prefer = Name | password` in the config, or the optional `sudo wifihop authorize`, also lets it join one specific network directly.
 - Linux: NetworkManager's saved connections.
 
 You only need to put a password in the config for a network the machine has never joined.

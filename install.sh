@@ -28,7 +28,7 @@ ACTION="install"
 PURGE=0
 START=1
 FORCE=0
-AUTHORIZE=1
+AUTHORIZE=0
 CONFIG_SRC=""
 SET_INTERVAL=""
 SET_FAILS=""
@@ -64,8 +64,8 @@ Install options:
   --fails N            Failed checks (out of the last 5) before switching (default 3)
   --no-start           Install everything but don't start the service yet
   --force              Install even if no Wi-Fi interface is detected right now
-  --no-authorize       macOS: skip the one-time approval for saved Wi-Fi passwords
-                       (run "sudo wifihop authorize" later instead)
+  --authorize          macOS, optional: approve keychain access so wifihop can join a
+                       specific network directly (not needed; see README)
 
 Removal:
   --uninstall          Stop and remove wifihop (keeps $CONF)
@@ -95,7 +95,7 @@ while [ $# -gt 0 ]; do
     --fails)     need_arg "$@"; SET_FAILS="$2"; shift 2 ;;
     --no-start)  START=0; shift ;;
     --force)     FORCE=1; shift ;;
-    --no-authorize) AUTHORIZE=0; shift ;;
+    --authorize) AUTHORIZE=1; shift ;;
     --uninstall) ACTION="uninstall"; shift ;;
     --purge)     PURGE=1; shift ;;
     -h|--help)   usage; exit 0 ;;
@@ -152,7 +152,7 @@ uninstall() {
       ok "stopped and removed the systemd service"
     fi
   fi
-  rm -f "$BIN" "$STATE"
+  rm -f "$BIN" "$STATE" /etc/wifihop.keychain-authorized
   ok "removed $BIN"
   if [ $PURGE -eq 1 ] && [ -f "$CONF" ]; then
     rm -f "$CONF" "$CONF.bak"; ok "removed $CONF"
@@ -387,21 +387,13 @@ EOF
   fi
 fi
 
-# ---------------------------------------------------------------- macOS: password approval
+# ---------------------------------------------------------------- macOS: optional password approval
 
-# macOS won't let a background service join a secured network without its password, and it
-# guards saved Wi-Fi passwords behind a one-time approval. Ask for it now, while someone is at the Mac.
-if [ "$OS" = Darwin ]; then
-  step "Allowing wifihop to use your saved Wi-Fi passwords"
-  if [ $AUTHORIZE -eq 0 ]; then
-    info "skipped (--no-authorize). Run this later: sudo wifihop authorize"
-  elif [ "$(stat -f %Su /dev/console)" = root ] || [ -n "${SSH_CONNECTION:-}" ]; then
-    warn "nobody is at this Mac's screen to approve the pop-ups; run this later at the Mac: sudo wifihop authorize"
-  else
-    info "A macOS pop-up will appear for each known network."
-    info "Enter your Mac login password and click \"Always Allow\" each time."
-    "$BIN" authorize | sed 's/^/  /' || warn "authorize didn't finish; you can re-run: sudo wifihop authorize"
-  fi
+# Not needed: on macOS wifihop switches by disconnecting and letting macOS auto-join, and macOS
+# already has the passwords. --authorize additionally allows direct joins to a chosen network.
+if [ "$OS" = Darwin ] && [ $AUTHORIZE -eq 1 ]; then
+  step "Allowing wifihop to read saved Wi-Fi passwords (optional)"
+  "$BIN" authorize | sed 's/^/  /' || warn "authorize didn't finish; you can re-run: sudo wifihop authorize"
 fi
 
 # ---------------------------------------------------------------- verify

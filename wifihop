@@ -5,7 +5,7 @@
 #
 # Written for bash 3.2 (the version macOS ships), so no associative arrays or mapfile.
 
-VERSION="1.2.0"
+VERSION="1.3.0"
 CONF="${WIFIHOP_CONF:-/etc/wifihop.conf}"
 STATE="/var/run/wifihop.current"
 MAC_LOG="/var/log/wifihop.log"
@@ -18,6 +18,7 @@ PRIMARY_RETRY=300         # seconds between attempts to return to the top networ
 CHECK_URL="http://captive.apple.com/hotspot-detect.html"
 CHECK_EXPECT="Success"
 CHECK_URL2="http://connectivitycheck.gstatic.com/generate_204"   # second opinion, expects HTTP 204
+FAILOVER_BACKOFF=60       # seconds to wait after a switch attempt found no working network
 RECHECK_INTERVAL=3        # seconds between checks while the internet looks down
 WINDOW=5                  # switch when FAILS_BEFORE_SWITCH of the last WINDOW checks failed
 IFACE_OVERRIDE=""
@@ -112,33 +113,68 @@ mac_nearby() {
   as_console_user osascript -l JavaScript -e "$mac_scan_js" 2>/dev/null | sed '/^$/d' | sort -u
 }
 
+# Only after "wifihop authorize" was approved; otherwise reading would pop up a macOS dialog.
+AUTH_MARK="/etc/wifihop.keychain-authorized"
 mac_keychain_pass() {
+  [ -e "$AUTH_MARK" ] || return 1
   security find-generic-password -D "AirPort network password" -a "$1" -w /Library/Keychains/System.keychain 2>/dev/null ||
     security find-generic-password -s "AirPort" -a "$1" -w /Library/Keychains/System.keychain 2>/dev/null
 }
 
+# A direct join needs the password: from the config, or from the keychain if "wifihop authorize"
+# was approved (optional). Without one, wifihop lets macOS do the joining instead (mac_last_resort).
+mac_can_join() {
+  [ -n "$2" ] || [ -n "$(mac_keychain_pass "$1")" ]
+}
+
 # networksetup prints nothing on success and an error message on failure (exit code is unreliable).
-# macOS won't join a secured network from a script without the password, so it comes from the
-# config or the System keychain (readable once "wifihop authorize" has been approved).
 mac_join() {
   local ifc="$1" ssid="$2" pass="$3" out
   [ -z "$pass" ] && pass="$(mac_keychain_pass "$ssid")"
-  [ -z "$pass" ] && log "  no password available for '$ssid' (run: sudo wifihop authorize), trying without"
-  if [ -n "$pass" ]; then
-    out="$(as_console_user networksetup -setairportnetwork "$ifc" "$ssid" "$pass" 2>&1)"
-  else
-    out="$(as_console_user networksetup -setairportnetwork "$ifc" "$ssid" 2>&1)"
-  fi
+  out="$(as_console_user networksetup -setairportnetwork "$ifc" "$ssid" "$pass" 2>&1)"
   [ -n "$out" ] && { log "  networksetup: $(printf '%s' "$out" | tr '\n' ' ')"; return 1; }
   return 0
 }
 
-# When no network could be joined directly, turn Wi-Fi off and on: macOS's own auto-join (which
-# has the passwords) then picks the highest known network in range.
+mac_disassociate_js='ObjC.import("CoreWLAN"); $.CWWiFiClient.sharedWiFiClient.interface.disassociate; "ok";'
+
+mac_router() { ipconfig getoption "$1" router 2>/dev/null; }
+
+# Wait up to JOIN_WAIT seconds for internet on the interface.
+wait_online() {
+  local ifc="$1" t=0
+  while [ $t -lt "$JOIN_WAIT" ]; do
+    sleep 3; t=$((t + 3))
+    online "$ifc" && return 0
+  done
+  return 1
+}
+
+# Let macOS switch for us. It already has every saved password, so no keychain access is needed:
+#  1. Disconnect from the dead network. macOS auto-join then picks another known network in
+#     range and avoids the one that was just left.
+#  2. If that doesn't bring the internet back, turn Wi-Fi off and on, so macOS joins the highest
+#     known network in range from scratch.
 mac_last_resort() {
-  local ifc="$1"
-  log "Turning Wi-Fi off and on so macOS auto-joins a known network"
+  local ifc="$1" round before after
+  for round in 1 2 3; do
+    before="$(mac_router "$ifc")"
+    log "Disconnecting from the current network (router ${before:-none}) so macOS auto-joins another known one (try $round/3)"
+    as_console_user osascript -l JavaScript -e "$mac_disassociate_js" >/dev/null 2>&1 ||
+      osascript -l JavaScript -e "$mac_disassociate_js" >/dev/null 2>&1
+    if wait_online "$ifc"; then
+      after="$(mac_router "$ifc")"
+      log "  macOS joined a network with internet (router ${after:-unknown})"
+      return 0
+    fi
+    after="$(mac_router "$ifc")"
+    [ -z "$after" ] && { log "  macOS didn't auto-join anything"; break; }
+    log "  macOS joined router $after, but it has no internet either"
+  done
+  log "Turning Wi-Fi off and on so macOS auto-joins from the top of its list"
   networksetup -setairportpower "$ifc" off; sleep 2; networksetup -setairportpower "$ifc" on
+  if wait_online "$ifc"; then log "  back online (router $(mac_router "$ifc"))"; return 0; fi
+  return 1
 }
 
 # ---------------------------------------------------------------- Linux backend (NetworkManager)
@@ -158,6 +194,7 @@ nm_current() { nmcli -t -e no -f DEVICE,NAME connection show --active 2>/dev/nul
 nm_nearby()  { nmcli -t -e no -f SSID device wifi list ifname "$1" --rescan auto 2>/dev/null | sed '/^$/d' | sort -u; }
 
 nm_last_resort() { return 1; }
+nm_can_join()    { return 0; }   # NetworkManager uses its own saved secrets
 
 nm_join() {
   local ifc="$1" name="$2" pass="$3" out
@@ -191,6 +228,7 @@ p_current()  { "${P}_current" "$@"; }
 p_nearby()   { "${P}_nearby" "$@"; }
 p_join()     { "${P}_join" "$@"; }
 p_last_resort() { "${P}_last_resort" "$@"; }
+p_can_join()    { "${P}_can_join" "$@"; }
 
 check_deps() {
   command -v curl >/dev/null || die "curl is required"
@@ -267,15 +305,11 @@ failover() {
       ssid="$(p_ssid_of "$name")"
       printf '%s\n' "$nearby_list" | grep -qxF "${ssid:-$name}" || continue
     fi
+    p_can_join "$name" "${CANDIDATE_PASS[$i]}" || continue
     join "$ifc" "$name" "${CANDIDATE_PASS[$i]}" && return 0
   done
-  if p_last_resort "$ifc"; then
-    local t=0
-    while [ $t -lt "$JOIN_WAIT" ]; do
-      sleep 3; t=$((t + 3))
-      online "$ifc" && { log "  back online after auto-join"; rm -f "$STATE"; return 0; }
-    done
-  fi
+  # Networks the script can't join itself (macOS without a known password) are left to the OS.
+  p_last_resort "$ifc" && { rm -f "$STATE"; return 0; }
   log "No known network has internet right now; will keep checking"
   return 1
 }
@@ -313,8 +347,11 @@ cmd_run() {
     if [ "${history: -1}" = "1" ]; then
       log "No internet on $ifc ($fails of the last ${#history} checks failed; switching at $FAILS_BEFORE_SWITCH)"
       if [ "$fails" -ge "$FAILS_BEFORE_SWITCH" ]; then
-        failover "$ifc"
         history=""; last_primary_try="$(date +%s)"
+        if ! failover "$ifc"; then
+          log "Waiting ${FAILOVER_BACKOFF}s before trying to switch again"
+          sleep "$FAILOVER_BACKOFF"
+        fi
       fi
       sleep "$RECHECK_INTERVAL"
       continue
@@ -408,6 +445,9 @@ cmd_authorize() {
   local ifc i name ok=0 bad=0; ifc="$(p_iface)"
   [ -n "$ifc" ] || die "no Wi-Fi interface found"
   build_candidates "$ifc"
+  echo "Optional: wifihop already switches without passwords by letting macOS auto-join."
+  echo "Approving keychain access lets it join a specific network directly instead."
+  echo
   echo "macOS will ask once per network for permission to use its saved Wi-Fi password."
   echo "Enter your Mac login password and click \"Always Allow\" (not just \"Allow\")."
   echo
@@ -415,7 +455,7 @@ cmd_authorize() {
     name="${CANDIDATES[$i]}"
     if [ -n "${CANDIDATE_PASS[$i]}" ]; then
       printf '  %-32s password set in config\n' "$name"; ok=$((ok + 1))
-    elif [ -n "$(mac_keychain_pass "$name")" ]; then
+    elif [ -n "$(AUTH_MARK=/dev/null mac_keychain_pass "$name")" ]; then
       printf '  %-32s ✓ allowed\n' "$name"; ok=$((ok + 1))
     else
       printf '  %-32s ✗ not allowed or no saved password\n' "$name"; bad=$((bad + 1))
@@ -423,6 +463,7 @@ cmd_authorize() {
   done
   echo
   echo "$ok ready, $bad unavailable."
+  if [ $ok -gt 0 ]; then touch "$AUTH_MARK"; else rm -f "$AUTH_MARK"; fi
   [ $bad -gt 0 ] && echo "Networks marked ✗ can still be used by adding \"prefer = NAME | password\" to $CONF."
   return 0
 }
@@ -462,7 +503,7 @@ Usage: wifihop <command>
   list      Show the networks wifihop will try, in order
   check     Test internet over Wi-Fi once (exit 0 = online)
   switch    Hop to the next working network right now (needs sudo)
-  authorize macOS: approve the background service reading saved Wi-Fi passwords (needs sudo)
+  authorize macOS, optional: approve reading saved Wi-Fi passwords for direct joins (needs sudo)
   diagnose  Read-only troubleshooting report; never changes the network
   run       Run the monitor in the foreground (the service does this; needs sudo)
   version   Print the version
