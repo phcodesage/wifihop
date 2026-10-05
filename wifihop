@@ -1,0 +1,358 @@
+#!/usr/bin/env bash
+# wifihop — hop to the next known Wi-Fi network when the current one loses internet.
+# Works on macOS (networksetup) and Linux (NetworkManager / nmcli).
+# https://github.com/phcodesage/wifihop
+#
+# Written for bash 3.2 (the version macOS ships), so no associative arrays or mapfile.
+
+VERSION="1.0.0"
+CONF="${WIFIHOP_CONF:-/etc/wifihop.conf}"
+STATE="/var/run/wifihop.current"
+MAC_LOG="/var/log/wifihop.log"
+
+# Defaults; every one of these can be overridden in the config file.
+CHECK_INTERVAL=10         # seconds between connectivity checks
+FAILS_BEFORE_SWITCH=3     # consecutive failed checks before switching
+JOIN_WAIT=20              # seconds to wait for a new network to get internet
+PRIMARY_RETRY=300         # seconds between attempts to return to the top network (0 = never)
+CHECK_URL="http://captive.apple.com/hotspot-detect.html"
+CHECK_EXPECT="Success"
+IFACE_OVERRIDE=""
+
+OS="$(uname -s)"
+
+log()  { printf '%s %s\n' "$(date '+%F %T')" "$*"; }
+die()  { printf 'wifihop: %s\n' "$*" >&2; exit 1; }
+trim() { local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf '%s' "$s"; }
+in_list() { local n="$1" x; shift; for x in "$@"; do [ "$x" = "$n" ] && return 0; done; return 1; }
+is_uint() { case "$1" in ''|*[!0-9]*) return 1;; *) return 0;; esac; }
+
+# ---------------------------------------------------------------- config
+
+# /etc/wifihop.conf — "key = value" lines, "#" comments. See wifihop.conf.example.
+load_config() {
+  PREFER=(); PREFER_PASS=(); EXCLUDE=()
+  [ -r "$CONF" ] || return 0
+  local line key val
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="$(trim "$line")"
+    case "$line" in ''|\#*) continue;; *=*) ;; *) log "config: ignoring line '$line'"; continue;; esac
+    key="$(trim "${line%%=*}")"; val="$(trim "${line#*=}")"
+    case "$key" in
+      check_interval|fails_before_switch|join_wait|primary_retry)
+        if ! is_uint "$val"; then log "config: $key must be a whole number, got '$val'"; continue; fi
+        case "$key" in
+          check_interval)      CHECK_INTERVAL="$val";;
+          fails_before_switch) FAILS_BEFORE_SWITCH="$val";;
+          join_wait)           JOIN_WAIT="$val";;
+          primary_retry)       PRIMARY_RETRY="$val";;
+        esac;;
+      check_url)    CHECK_URL="$val";;
+      check_expect) CHECK_EXPECT="$val";;
+      interface)    IFACE_OVERRIDE="$val";;
+      prefer)
+        if [[ "$val" == *"|"* ]]; then
+          PREFER+=("$(trim "${val%%|*}")"); PREFER_PASS+=("$(trim "${val#*|}")")
+        else
+          PREFER+=("$val"); PREFER_PASS+=("")
+        fi;;
+      exclude) EXCLUDE+=("$val");;
+      *) log "config: unknown key '$key'";;
+    esac
+  done < "$CONF"
+}
+
+# ---------------------------------------------------------------- macOS backend
+
+mac_iface()    { networksetup -listallhardwareports 2>/dev/null | awk '/Hardware Port: (Wi-Fi|AirPort)/{getline; print $2; exit}'; }
+mac_known()    { networksetup -listpreferredwirelessnetworks "$1" 2>/dev/null | tail -n +2 | sed 's/^[[:space:]]*//'; }
+mac_radio_on() { networksetup -getairportpower "$1" 2>/dev/null | grep -q ': On'; }
+mac_ssid_of()  { printf '%s\n' "$1"; }
+
+# macOS 15+ redacts the SSID for processes without Location access, so fall back to what we joined last.
+mac_current() {
+  local s
+  s="$(ipconfig getsummary "$1" 2>/dev/null | awk -F ' SSID : ' '/ SSID : /{print $2; exit}')"
+  if [ -n "$s" ] && [ "$s" != "<redacted>" ]; then printf '%s\n' "$s"; else cat "$STATE" 2>/dev/null; fi
+}
+
+# SSIDs in range. Empty when macOS redacts names, in which case every known network is tried.
+mac_nearby() {
+  system_profiler SPAirPortDataType 2>/dev/null |
+    awk '/Current Network Information:|Other Local Wi-Fi Networks:/{f=1; next}
+         f && /^            [^ ].*:$/{sub(/^ +/,""); sub(/:$/,""); print}' |
+    grep -v '<redacted>'
+}
+
+mac_keychain_pass() {
+  security find-generic-password -D "AirPort network password" -a "$1" -w /Library/Keychains/System.keychain 2>/dev/null ||
+    security find-generic-password -s "AirPort" -a "$1" -w /Library/Keychains/System.keychain 2>/dev/null
+}
+
+# networksetup prints nothing on success and an error message on failure (exit code is unreliable).
+mac_join() {
+  local ifc="$1" ssid="$2" pass="$3" out
+  if [ -n "$pass" ]; then
+    out="$(networksetup -setairportnetwork "$ifc" "$ssid" "$pass" 2>&1)"
+  else
+    out="$(networksetup -setairportnetwork "$ifc" "$ssid" 2>&1)"
+    if [ -n "$out" ]; then
+      log "  saved credentials failed: $out"
+      pass="$(mac_keychain_pass "$ssid")"
+      [ -z "$pass" ] && { log "  no keychain password for '$ssid'"; return 1; }
+      log "  retrying with keychain password"
+      out="$(networksetup -setairportnetwork "$ifc" "$ssid" "$pass" 2>&1)"
+    fi
+  fi
+  [ -n "$out" ] && { log "  networksetup: $out"; return 1; }
+  return 0
+}
+
+# ---------------------------------------------------------------- Linux backend (NetworkManager)
+
+nm_iface()    { nmcli -t -f DEVICE,TYPE device 2>/dev/null | awk -F: '$2=="wifi"{print $1; exit}'; }
+nm_radio_on() { [ "$(nmcli radio wifi 2>/dev/null)" = "enabled" ]; }
+nm_ssid_of()  { nmcli -g 802-11-wireless.ssid connection show id "$1" 2>/dev/null; }
+
+# Saved Wi-Fi connections, highest autoconnect priority first (NAME is last so ":" in names is safe).
+nm_known() {
+  nmcli -t -e no -f TYPE,AUTOCONNECT-PRIORITY,NAME connection show 2>/dev/null |
+    awk -F: '$1=="802-11-wireless"{p=$2; sub(/^[^:]*:[^:]*:/,""); print p "\t" $0}' |
+    sort -s -t "$(printf '\t')" -k1,1nr | cut -f2-
+}
+
+nm_current() { nmcli -t -e no -f DEVICE,NAME connection show --active 2>/dev/null | awk -F: -v d="$1" '$1==d{sub(/^[^:]*:/,""); print; exit}'; }
+nm_nearby()  { nmcli -t -e no -f SSID device wifi list ifname "$1" --rescan auto 2>/dev/null | sed '/^$/d' | sort -u; }
+
+nm_join() {
+  local ifc="$1" name="$2" pass="$3" out
+  if [ -n "$pass" ]; then
+    out="$(nmcli --wait "$JOIN_WAIT" device wifi connect "$name" password "$pass" ifname "$ifc" 2>&1)"
+  elif nmcli -t -f NAME connection show 2>/dev/null | grep -qxF "$name"; then
+    out="$(nmcli --wait "$JOIN_WAIT" connection up id "$name" ifname "$ifc" 2>&1)"
+  else
+    out="$(nmcli --wait "$JOIN_WAIT" device wifi connect "$name" ifname "$ifc" 2>&1)"
+  fi
+  local rc=$?
+  [ $rc -ne 0 ] && log "  nmcli: $out"
+  return $rc
+}
+
+# ---------------------------------------------------------------- platform dispatch
+
+case "$OS" in
+  Darwin) P=mac ;;
+  Linux)  P=nm  ;;
+  *)      die "unsupported OS: $OS (macOS and Linux only)" ;;
+esac
+
+p_iface() {
+  if [ -n "$IFACE_OVERRIDE" ]; then printf '%s\n' "$IFACE_OVERRIDE"; else "${P}_iface"; fi
+}
+p_known()    { "${P}_known" "$@"; }
+p_radio_on() { "${P}_radio_on" "$@"; }
+p_ssid_of()  { "${P}_ssid_of" "$@"; }
+p_current()  { "${P}_current" "$@"; }
+p_nearby()   { "${P}_nearby" "$@"; }
+p_join()     { "${P}_join" "$@"; }
+
+check_deps() {
+  command -v curl >/dev/null || die "curl is required"
+  if [ "$P" = mac ]; then
+    command -v networksetup >/dev/null || die "networksetup not found"
+  else
+    command -v nmcli >/dev/null || die "nmcli not found: wifihop on Linux needs NetworkManager"
+  fi
+}
+
+# ---------------------------------------------------------------- core
+
+# Internet check bound to the Wi-Fi interface, so a working Ethernet link can't hide a dead Wi-Fi.
+online() {
+  local ifc="$1"
+  case "$(curl -s --interface "$ifc" --max-time 5 "$CHECK_URL" 2>/dev/null)" in
+    *"$CHECK_EXPECT"*) return 0 ;;
+  esac
+  curl -s --interface "$ifc" --max-time 5 -o /dev/null https://1.1.1.1 2>/dev/null
+}
+
+# Fills CANDIDATES/CANDIDATE_PASS: config "prefer" entries first, then the OS's known networks, minus excludes.
+build_candidates() {
+  local ifc="$1" n i
+  CANDIDATES=(); CANDIDATE_PASS=()
+  for ((i = 0; i < ${#PREFER[@]}; i++)); do
+    n="${PREFER[$i]}"
+    in_list "$n" ${EXCLUDE[@]+"${EXCLUDE[@]}"} && continue
+    in_list "$n" ${CANDIDATES[@]+"${CANDIDATES[@]}"} && continue
+    CANDIDATES+=("$n"); CANDIDATE_PASS+=("${PREFER_PASS[$i]}")
+  done
+  while IFS= read -r n; do
+    [ -z "$n" ] && continue
+    in_list "$n" ${EXCLUDE[@]+"${EXCLUDE[@]}"} && continue
+    in_list "$n" ${CANDIDATES[@]+"${CANDIDATES[@]}"} && continue
+    CANDIDATES+=("$n"); CANDIDATE_PASS+=("")
+  done < <(p_known "$ifc")
+}
+
+candidate_pass() {
+  local i
+  for ((i = 0; i < ${#CANDIDATES[@]}; i++)); do
+    [ "${CANDIDATES[$i]}" = "$1" ] && { printf '%s' "${CANDIDATE_PASS[$i]}"; return; }
+  done
+}
+
+join() {
+  local ifc="$1" name="$2" pass="$3" t=0
+  log "Joining '$name'..."
+  p_join "$ifc" "$name" "$pass" || { log "  could not join '$name'"; return 1; }
+  while [ $t -lt "$JOIN_WAIT" ]; do
+    sleep 3; t=$((t + 3))
+    if online "$ifc"; then
+      log "  '$name' is online"
+      printf '%s\n' "$name" > "$STATE"
+      return 0
+    fi
+  done
+  log "  '$name' joined but has no internet"
+  return 1
+}
+
+failover() {
+  local ifc="$1" cur nearby_list i name ssid
+  cur="$(p_current "$ifc")"
+  nearby_list="$(p_nearby "$ifc")"
+  [ -n "$nearby_list" ] && log "In range: $(printf '%s' "$nearby_list" | paste -sd ',' - | sed 's/,/, /g')"
+  for ((i = 0; i < ${#CANDIDATES[@]}; i++)); do
+    name="${CANDIDATES[$i]}"
+    [ "$name" = "$cur" ] && continue
+    # Skip networks that are visibly out of range (only when the scan returned real names).
+    if [ -n "$nearby_list" ]; then
+      ssid="$(p_ssid_of "$name")"
+      printf '%s\n' "$nearby_list" | grep -qxF "${ssid:-$name}" || continue
+    fi
+    join "$ifc" "$name" "${CANDIDATE_PASS[$i]}" && return 0
+  done
+  log "No known network has internet right now; will keep checking"
+  return 1
+}
+
+cmd_run() {
+  [ "$(id -u)" -eq 0 ] || die "run must be started as root (normally by the wifihop service)"
+  check_deps
+  load_config
+  log "wifihop $VERSION started on $OS (config: $CONF)"
+  local fails=0 last_primary_try now ifc cur warned_iface=0
+  last_primary_try="$(date +%s)"
+  while true; do
+    load_config
+    ifc="$(p_iface)"
+    if [ -z "$ifc" ]; then
+      [ $warned_iface -eq 0 ] && log "No Wi-Fi interface found; waiting"
+      warned_iface=1; sleep 60; continue
+    fi
+    warned_iface=0
+    if ! p_radio_on "$ifc"; then sleep 30; continue; fi
+    build_candidates "$ifc"
+    if [ ${#CANDIDATES[@]} -eq 0 ]; then sleep 60; continue; fi
+
+    if online "$ifc"; then
+      fails=0
+      cur="$(p_current "$ifc")"
+      now="$(date +%s)"
+      if [ "$PRIMARY_RETRY" -gt 0 ] && [ -n "$cur" ] && [ "$cur" != "${CANDIDATES[0]}" ] &&
+         [ $((now - last_primary_try)) -ge "$PRIMARY_RETRY" ]; then
+        last_primary_try="$now"
+        log "On backup '$cur'; checking whether '${CANDIDATES[0]}' is back"
+        join "$ifc" "${CANDIDATES[0]}" "${CANDIDATE_PASS[0]}" ||
+          join "$ifc" "$cur" "$(candidate_pass "$cur")" ||
+          failover "$ifc"
+      fi
+    else
+      fails=$((fails + 1))
+      log "No internet on $ifc ($fails/$FAILS_BEFORE_SWITCH)"
+      if [ $fails -ge "$FAILS_BEFORE_SWITCH" ]; then
+        failover "$ifc"
+        fails=0; last_primary_try="$(date +%s)"
+      fi
+    fi
+    sleep "$CHECK_INTERVAL"
+  done
+}
+
+cmd_list() {
+  check_deps; load_config
+  local ifc i; ifc="$(p_iface)"
+  [ -n "$ifc" ] || die "no Wi-Fi interface found"
+  build_candidates "$ifc"
+  echo "Networks wifihop will try on $ifc, in order:"
+  for ((i = 0; i < ${#CANDIDATES[@]}; i++)); do
+    printf '  %2d. %s%s\n' $((i + 1)) "${CANDIDATES[$i]}" "$([ -n "${CANDIDATE_PASS[$i]}" ] && echo '  (password from config)')"
+  done
+  [ ${#EXCLUDE[@]} -gt 0 ] && printf '  excluded: %s\n' "$(IFS=,; echo "${EXCLUDE[*]}" | sed 's/,/, /g')"
+  return 0
+}
+
+cmd_status() {
+  check_deps; load_config
+  local ifc cur; ifc="$(p_iface)"
+  echo "wifihop $VERSION ($OS)"
+  echo "  config:     $CONF $([ -r "$CONF" ] || echo '(not found, using defaults)')"
+  if [ -z "$ifc" ]; then echo "  interface:  none found"; return 1; fi
+  echo "  interface:  $ifc"
+  if p_radio_on "$ifc"; then echo "  radio:      on"; else echo "  radio:      off"; fi
+  cur="$(p_current "$ifc")"
+  echo "  network:    ${cur:-unknown}"
+  if online "$ifc"; then echo "  internet:   yes"; else echo "  internet:   NO"; fi
+  if [ "$P" = mac ]; then
+    if launchctl print system/io.github.phcodesage.wifihop >/dev/null 2>&1; then echo "  service:    running"; else echo "  service:    not running"; fi
+    [ -r "$MAC_LOG" ] && { echo "  recent log:"; tail -n 5 "$MAC_LOG" | sed 's/^/    /'; }
+  else
+    echo "  service:    $(systemctl is-active wifihop 2>/dev/null)"
+    echo "  recent log:"; journalctl -u wifihop -n 5 --no-pager -o cat 2>/dev/null | sed 's/^/    /'
+  fi
+  return 0
+}
+
+cmd_check() {
+  check_deps; load_config
+  local ifc; ifc="$(p_iface)"
+  [ -n "$ifc" ] || die "no Wi-Fi interface found"
+  if online "$ifc"; then echo "online ($ifc)"; else echo "offline ($ifc)"; return 1; fi
+}
+
+cmd_switch() {
+  [ "$(id -u)" -eq 0 ] || die "switch needs root: sudo wifihop switch"
+  check_deps; load_config
+  local ifc; ifc="$(p_iface)"
+  [ -n "$ifc" ] || die "no Wi-Fi interface found"
+  build_candidates "$ifc"
+  failover "$ifc"
+}
+
+usage() {
+  cat <<EOF
+wifihop $VERSION — switch to the next known Wi-Fi network when the internet drops.
+
+Usage: wifihop <command>
+
+  status    Show interface, current network, internet status and service state
+  list      Show the networks wifihop will try, in order
+  check     Test internet over Wi-Fi once (exit 0 = online)
+  switch    Hop to the next working network right now (needs sudo)
+  run       Run the monitor in the foreground (the service does this; needs sudo)
+  version   Print the version
+
+Config: $CONF (optional; see https://github.com/phcodesage/wifihop)
+EOF
+}
+
+case "${1:-}" in
+  run)          cmd_run ;;
+  status)       cmd_status ;;
+  list)         cmd_list ;;
+  check)        cmd_check ;;
+  switch)       cmd_switch ;;
+  version|-v|--version) echo "wifihop $VERSION" ;;
+  ''|help|-h|--help)    usage ;;
+  *) usage >&2; exit 2 ;;
+esac

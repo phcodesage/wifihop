@@ -1,0 +1,29 @@
+# wifihop configuration — https://github.com/phcodesage/wifihop
+#
+# With no "prefer" lines, wifihop uses this machine's own known Wi-Fi networks:
+#   macOS: System Settings > Wi-Fi > Known Networks, in their saved order
+#   Linux: NetworkManager Wi-Fi connections, highest autoconnect priority first
+# Changes here are picked up automatically on the next check; no restart needed.
+
+# How often to test the internet, in seconds.
+check_interval = 10
+
+# How many failed tests in a row before switching networks.
+fails_before_switch = 3
+
+# How long to wait for a newly joined network to reach the internet, in seconds.
+join_wait = 20
+
+# While on a backup network, how often to try going back to the first network
+# in the list, in seconds. 0 = stay on the backup until it fails.
+primary_retry = 300
+
+# Try these first, in this order. Add "| password" if the machine doesn't have it saved.
+# prefer = Office-WiFi
+# prefer = Office-Backup | the-password
+
+# Never switch to these automatically (phone hotspots, metered connections...).
+# exclude = My iPhone
+
+# Pin a specific Wi-Fi interface instead of auto-detecting it.
+# interface = en0
