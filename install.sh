@@ -28,6 +28,7 @@ ACTION="install"
 PURGE=0
 START=1
 FORCE=0
+AUTHORIZE=1
 CONFIG_SRC=""
 SET_INTERVAL=""
 SET_FAILS=""
@@ -63,6 +64,8 @@ Install options:
   --fails N            Failed checks (out of the last 5) before switching (default 3)
   --no-start           Install everything but don't start the service yet
   --force              Install even if no Wi-Fi interface is detected right now
+  --no-authorize       macOS: skip the one-time approval for saved Wi-Fi passwords
+                       (run "sudo wifihop authorize" later instead)
 
 Removal:
   --uninstall          Stop and remove wifihop (keeps $CONF)
@@ -92,6 +95,7 @@ while [ $# -gt 0 ]; do
     --fails)     need_arg "$@"; SET_FAILS="$2"; shift 2 ;;
     --no-start)  START=0; shift ;;
     --force)     FORCE=1; shift ;;
+    --no-authorize) AUTHORIZE=0; shift ;;
     --uninstall) ACTION="uninstall"; shift ;;
     --purge)     PURGE=1; shift ;;
     -h|--help)   usage; exit 0 ;;
@@ -383,6 +387,23 @@ EOF
   fi
 fi
 
+# ---------------------------------------------------------------- macOS: password approval
+
+# macOS won't let a background service join a secured network without its password, and it
+# guards saved Wi-Fi passwords behind a one-time approval. Ask for it now, while someone is at the Mac.
+if [ "$OS" = Darwin ]; then
+  step "Allowing wifihop to use your saved Wi-Fi passwords"
+  if [ $AUTHORIZE -eq 0 ]; then
+    info "skipped (--no-authorize). Run this later: sudo wifihop authorize"
+  elif [ "$(stat -f %Su /dev/console)" = root ] || [ -n "${SSH_CONNECTION:-}" ]; then
+    warn "nobody is at this Mac's screen to approve the pop-ups; run this later at the Mac: sudo wifihop authorize"
+  else
+    info "A macOS pop-up will appear for each known network."
+    info "Enter your Mac login password and click \"Always Allow\" each time."
+    "$BIN" authorize | sed 's/^/  /' || warn "authorize didn't finish; you can re-run: sudo wifihop authorize"
+  fi
+fi
+
 # ---------------------------------------------------------------- verify
 
 if [ $START -eq 1 ]; then
@@ -409,6 +430,7 @@ starts automatically at every boot, and restarts itself if it ever stops.
   wifihop status          current network, internet status, recent activity
   wifihop list            the networks it will try, in order
   sudo wifihop switch     hop to the next working network right now
+  sudo wifihop diagnose   read-only troubleshooting report
   $LOGCMD
   sudo nano $CONF   change the order, exclude networks, add passwords
 

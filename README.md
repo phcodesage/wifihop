@@ -41,6 +41,7 @@ curl -fsSL https://raw.githubusercontent.com/phcodesage/wifihop/main/install.sh 
 | `--fails N` | Failed checks (out of the last 5) before switching (default 3) |
 | `--config FILE` | Install your own config file |
 | `--no-start` | Install everything, but don't start the service yet |
+| `--no-authorize` | macOS: skip the one-time password approval (run `sudo wifihop authorize` later) |
 | `--force` | Install even if no Wi-Fi interface is detected right now |
 | `--uninstall [--purge]` | Remove wifihop (`--purge` also deletes the config) |
 
@@ -74,6 +75,8 @@ wifihop status        # interface, current network, internet status, recent acti
 wifihop list          # the networks it will try, in order
 wifihop check         # test internet over Wi-Fi once (exit code 0 = online)
 sudo wifihop switch   # hop to the next working network right now
+sudo wifihop diagnose # read-only troubleshooting report, never changes the network
+sudo wifihop authorize # macOS: re-run the one-time password approval
 ```
 
 Logs:
@@ -97,7 +100,7 @@ journalctl -u wifihop -f          # Linux
 `prefer` entries in the config always go first.
 
 **Passwords** come from the machine itself:
-- macOS: the System keychain.
+- macOS: the System keychain. macOS guards these, so the installer asks once per network: enter your login password and click **Always Allow**. After that the service reads them silently. Re-run with `sudo wifihop authorize` if you add networks later.
 - Linux: NetworkManager's saved connections.
 
 You only need to put a password in the config for a network the machine has never joined.
@@ -133,7 +136,7 @@ See [`wifihop.conf.example`](wifihop.conf.example).
 
 ## Notes
 
-- **Hidden network names on macOS 15+:** macOS hides Wi-Fi names from background processes. wifihop remembers which network it joined, and when the in-range scan returns hidden names it simply tries every known network in order.
+- **Hidden network names on macOS 15+:** macOS hides Wi-Fi names from background services. wifihop therefore scans and joins inside the logged-in user's session, where names are visible. With nobody logged in, it falls back to turning Wi-Fi off and on, which lets macOS auto-join the top known network.
 - **Turning Wi-Fi off:** if you switch Wi-Fi off, wifihop waits and does nothing until it's back on.
 - **Captive portals:** hotel and airport login pages count as "no internet", so wifihop moves on to the next network.
 

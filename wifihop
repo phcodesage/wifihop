@@ -5,7 +5,7 @@
 #
 # Written for bash 3.2 (the version macOS ships), so no associative arrays or mapfile.
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 CONF="${WIFIHOP_CONF:-/etc/wifihop.conf}"
 STATE="/var/run/wifihop.current"
 MAC_LOG="/var/log/wifihop.log"
@@ -82,12 +82,34 @@ mac_current() {
   if [ -n "$s" ] && [ "$s" != "<redacted>" ]; then printf '%s\n' "$s"; else cat "$STATE" 2>/dev/null; fi
 }
 
-# SSIDs in range. Empty when macOS redacts names, in which case every known network is tried.
+# macOS hides Wi-Fi names from root services (Location Services privacy), but not from the
+# logged-in user's session. So scanning and joining run as the console user when there is one.
+mac_console_user() {
+  local u; u="$(stat -f %Su /dev/console 2>/dev/null)"
+  case "$u" in ''|root|loginwindow|_mbsetupuser) return 1;; esac
+  printf '%s\n' "$u"
+}
+
+as_console_user() {
+  local u uid
+  if [ "$(id -u)" -eq 0 ] && u="$(mac_console_user)"; then
+    uid="$(id -u "$u")"
+    launchctl asuser "$uid" sudo -u "$u" "$@"
+  else
+    "$@"
+  fi
+}
+
+# SSIDs in range, via CoreWLAN from JavaScript for Automation (built into every Mac, no Xcode needed).
+mac_scan_js='ObjC.import("CoreWLAN");
+var set = $.CWWiFiClient.sharedWiFiClient.interface.scanForNetworksWithNameError($(), $());
+var out = [], arr = set ? set.allObjects : null;
+for (var k = 0; arr && k < arr.count; k++) { var s = arr.objectAtIndex(k).ssid; if (s && !s.isNil()) out.push(ObjC.unwrap(s)); }
+out.join("\n");'
+
+# Empty when names are still hidden, in which case every known network is tried.
 mac_nearby() {
-  system_profiler SPAirPortDataType 2>/dev/null |
-    awk '/Current Network Information:|Other Local Wi-Fi Networks:/{f=1; next}
-         f && /^            [^ ].*:$/{sub(/^ +/,""); sub(/:$/,""); print}' |
-    grep -v '<redacted>'
+  as_console_user osascript -l JavaScript -e "$mac_scan_js" 2>/dev/null | sed '/^$/d' | sort -u
 }
 
 mac_keychain_pass() {
@@ -96,22 +118,27 @@ mac_keychain_pass() {
 }
 
 # networksetup prints nothing on success and an error message on failure (exit code is unreliable).
+# macOS won't join a secured network from a script without the password, so it comes from the
+# config or the System keychain (readable once "wifihop authorize" has been approved).
 mac_join() {
   local ifc="$1" ssid="$2" pass="$3" out
+  [ -z "$pass" ] && pass="$(mac_keychain_pass "$ssid")"
+  [ -z "$pass" ] && log "  no password available for '$ssid' (run: sudo wifihop authorize), trying without"
   if [ -n "$pass" ]; then
-    out="$(networksetup -setairportnetwork "$ifc" "$ssid" "$pass" 2>&1)"
+    out="$(as_console_user networksetup -setairportnetwork "$ifc" "$ssid" "$pass" 2>&1)"
   else
-    out="$(networksetup -setairportnetwork "$ifc" "$ssid" 2>&1)"
-    if [ -n "$out" ]; then
-      log "  saved credentials failed: $out"
-      pass="$(mac_keychain_pass "$ssid")"
-      [ -z "$pass" ] && { log "  no keychain password for '$ssid'"; return 1; }
-      log "  retrying with keychain password"
-      out="$(networksetup -setairportnetwork "$ifc" "$ssid" "$pass" 2>&1)"
-    fi
+    out="$(as_console_user networksetup -setairportnetwork "$ifc" "$ssid" 2>&1)"
   fi
-  [ -n "$out" ] && { log "  networksetup: $out"; return 1; }
+  [ -n "$out" ] && { log "  networksetup: $(printf '%s' "$out" | tr '\n' ' ')"; return 1; }
   return 0
+}
+
+# When no network could be joined directly, turn Wi-Fi off and on: macOS's own auto-join (which
+# has the passwords) then picks the highest known network in range.
+mac_last_resort() {
+  local ifc="$1"
+  log "Turning Wi-Fi off and on so macOS auto-joins a known network"
+  networksetup -setairportpower "$ifc" off; sleep 2; networksetup -setairportpower "$ifc" on
 }
 
 # ---------------------------------------------------------------- Linux backend (NetworkManager)
@@ -129,6 +156,8 @@ nm_known() {
 
 nm_current() { nmcli -t -e no -f DEVICE,NAME connection show --active 2>/dev/null | awk -F: -v d="$1" '$1==d{sub(/^[^:]*:/,""); print; exit}'; }
 nm_nearby()  { nmcli -t -e no -f SSID device wifi list ifname "$1" --rescan auto 2>/dev/null | sed '/^$/d' | sort -u; }
+
+nm_last_resort() { return 1; }
 
 nm_join() {
   local ifc="$1" name="$2" pass="$3" out
@@ -161,6 +190,7 @@ p_ssid_of()  { "${P}_ssid_of" "$@"; }
 p_current()  { "${P}_current" "$@"; }
 p_nearby()   { "${P}_nearby" "$@"; }
 p_join()     { "${P}_join" "$@"; }
+p_last_resort() { "${P}_last_resort" "$@"; }
 
 check_deps() {
   command -v curl >/dev/null || die "curl is required"
@@ -239,6 +269,13 @@ failover() {
     fi
     join "$ifc" "$name" "${CANDIDATE_PASS[$i]}" && return 0
   done
+  if p_last_resort "$ifc"; then
+    local t=0
+    while [ $t -lt "$JOIN_WAIT" ]; do
+      sleep 3; t=$((t + 3))
+      online "$ifc" && { log "  back online after auto-join"; rm -f "$STATE"; return 0; }
+    done
+  fi
   log "No known network has internet right now; will keep checking"
   return 1
 }
@@ -362,6 +399,59 @@ cmd_switch() {
   failover "$ifc"
 }
 
+# macOS only: read each known network's password once from the Terminal, so macOS asks for
+# approval. Choosing "Always Allow" lets the background service read it later without a prompt.
+cmd_authorize() {
+  [ "$P" = mac ] || { echo "Not needed on Linux: NetworkManager already has the passwords."; return 0; }
+  [ "$(id -u)" -eq 0 ] || die "authorize needs root: sudo wifihop authorize"
+  load_config
+  local ifc i name ok=0 bad=0; ifc="$(p_iface)"
+  [ -n "$ifc" ] || die "no Wi-Fi interface found"
+  build_candidates "$ifc"
+  echo "macOS will ask once per network for permission to use its saved Wi-Fi password."
+  echo "Enter your Mac login password and click \"Always Allow\" (not just \"Allow\")."
+  echo
+  for ((i = 0; i < ${#CANDIDATES[@]}; i++)); do
+    name="${CANDIDATES[$i]}"
+    if [ -n "${CANDIDATE_PASS[$i]}" ]; then
+      printf '  %-32s password set in config\n' "$name"; ok=$((ok + 1))
+    elif [ -n "$(mac_keychain_pass "$name")" ]; then
+      printf '  %-32s ✓ allowed\n' "$name"; ok=$((ok + 1))
+    else
+      printf '  %-32s ✗ not allowed or no saved password\n' "$name"; bad=$((bad + 1))
+    fi
+  done
+  echo
+  echo "$ok ready, $bad unavailable."
+  [ $bad -gt 0 ] && echo "Networks marked ✗ can still be used by adding \"prefer = NAME | password\" to $CONF."
+  return 0
+}
+
+# Read-only checks for troubleshooting; never changes the network.
+cmd_diagnose() {
+  check_deps; load_config
+  local ifc u n; ifc="$(p_iface)"
+  echo "wifihop $VERSION diagnose ($OS, running as $(id -un))"
+  echo "  interface:      ${ifc:-NONE}"
+  [ -n "$ifc" ] || return 1
+  if online "$ifc"; then echo "  internet:       yes"; else echo "  internet:       NO"; fi
+  build_candidates "$ifc"
+  echo "  known networks: ${#CANDIDATES[@]}"
+  if [ "$P" = mac ]; then
+    if u="$(mac_console_user)"; then echo "  console user:   $u (scans and joins run as this user)"
+    else echo "  console user:   none logged in (network names may be hidden; joins may fail)"; fi
+    n="$(mac_nearby | grep -c .)"
+    echo "  networks seen:  $n in range$([ "$n" -eq 0 ] && echo ' (names hidden or scan failed)')"
+    echo "  service:        $(launchctl print system/io.github.phcodesage.wifihop >/dev/null 2>&1 && echo running || echo 'not running')"
+    [ "$(id -u)" -eq 0 ] || echo "  (run with sudo to test what the background service sees)"
+  else
+    n="$(nm_nearby "$ifc" | grep -c .)"
+    echo "  networks seen:  $n in range"
+    echo "  service:        $(systemctl is-active wifihop 2>/dev/null)"
+  fi
+  return 0
+}
+
 usage() {
   cat <<EOF
 wifihop $VERSION — switch to the next known Wi-Fi network when the internet drops.
@@ -372,6 +462,8 @@ Usage: wifihop <command>
   list      Show the networks wifihop will try, in order
   check     Test internet over Wi-Fi once (exit 0 = online)
   switch    Hop to the next working network right now (needs sudo)
+  authorize macOS: approve the background service reading saved Wi-Fi passwords (needs sudo)
+  diagnose  Read-only troubleshooting report; never changes the network
   run       Run the monitor in the foreground (the service does this; needs sudo)
   version   Print the version
 
@@ -385,6 +477,8 @@ case "${1:-}" in
   list)         cmd_list ;;
   check)        cmd_check ;;
   switch)       cmd_switch ;;
+  authorize)    cmd_authorize ;;
+  diagnose)     cmd_diagnose ;;
   version|-v|--version) echo "wifihop $VERSION" ;;
   ''|help|-h|--help)    usage ;;
   *) usage >&2; exit 2 ;;
