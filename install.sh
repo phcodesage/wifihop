@@ -5,6 +5,7 @@
 # Install from a clone:      sudo ./install.sh
 # Install straight from web: curl -fsSL https://raw.githubusercontent.com/phcodesage/wifihop/main/install.sh | sudo bash
 # Uninstall:                 sudo ./install.sh --uninstall   (add --purge to also delete the config)
+#                            curl -fsSL https://raw.githubusercontent.com/phcodesage/wifihop/main/install.sh | sudo bash -s -- --uninstall
 #
 # Run ./install.sh --help for every option.
 
@@ -397,7 +398,8 @@ echo
 if [ "$OS" = Darwin ]; then LOGCMD="tail -f $MAC_LOG"; else LOGCMD="journalctl -u wifihop -f"; fi
 cat <<EOF
 
-${GREEN}${BOLD}wifihop is installed.${RESET}
+${GREEN}${BOLD}wifihop is installed.${RESET} It runs in the background as a system service,
+starts automatically at every boot, and restarts itself if it ever stops.
 
   wifihop status          current network, internet status, recent activity
   wifihop list            the networks it will try, in order
@@ -405,5 +407,5 @@ ${GREEN}${BOLD}wifihop is installed.${RESET}
   $LOGCMD
   sudo nano $CONF   change the order, exclude networks, add passwords
 
-  Uninstall:  sudo $([ -n "$SRC_DIR" ] && echo "$SRC_DIR/install.sh" || echo "bash install.sh") --uninstall
+  Uninstall:  $([ -n "$SRC_DIR" ] && echo "sudo $SRC_DIR/install.sh --uninstall" || echo "curl -fsSL $RAW_URL/install.sh | sudo bash -s -- --uninstall")
 EOF

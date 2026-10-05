@@ -54,6 +54,19 @@ curl -fsSL https://raw.githubusercontent.com/phcodesage/wifihop/main/install.sh 
 
 NetworkManager is the default on Ubuntu, Fedora, Debian desktop, Linux Mint, Pop!_OS, Manjaro and Raspberry Pi OS (Bookworm and later). Systems that manage Wi-Fi only with wpa_supplicant, iwd or systemd-networkd aren't supported yet.
 
+## Runs in the background
+
+Once installed, wifihop runs as a root system service, not as an app or a terminal process:
+
+| | macOS | Linux |
+|---|---|---|
+| Service | `/Library/LaunchDaemons/io.github.phcodesage.wifihop.plist` | `/etc/systemd/system/wifihop.service` |
+| Starts at boot | yes (`RunAtLoad`), before anyone logs in | yes (`enabled`, `multi-user.target`) |
+| Restarts if it stops | yes (`KeepAlive`) | yes (`Restart=always`) |
+| Check it | `sudo launchctl print system/io.github.phcodesage.wifihop` | `systemctl status wifihop` |
+
+Closing the terminal, logging out, or rebooting doesn't stop it. Only `--uninstall` does.
+
 ## Usage
 
 ```sh
@@ -125,6 +138,8 @@ See [`wifihop.conf.example`](wifihop.conf.example).
 ## Uninstall
 
 ```sh
+curl -fsSL https://raw.githubusercontent.com/phcodesage/wifihop/main/install.sh | sudo bash -s -- --uninstall
+# or from a clone:
 sudo ./install.sh --uninstall          # keeps /etc/wifihop.conf
 sudo ./install.sh --uninstall --purge  # removes everything
 ```
