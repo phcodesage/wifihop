@@ -5,18 +5,21 @@
 #
 # Written for bash 3.2 (the version macOS ships), so no associative arrays or mapfile.
 
-VERSION="1.0.1"
+VERSION="1.1.0"
 CONF="${WIFIHOP_CONF:-/etc/wifihop.conf}"
 STATE="/var/run/wifihop.current"
 MAC_LOG="/var/log/wifihop.log"
 
 # Defaults; every one of these can be overridden in the config file.
 CHECK_INTERVAL=10         # seconds between connectivity checks
-FAILS_BEFORE_SWITCH=3     # consecutive failed checks before switching
+FAILS_BEFORE_SWITCH=3     # failed checks (out of the last WINDOW) before switching
 JOIN_WAIT=20              # seconds to wait for a new network to get internet
 PRIMARY_RETRY=300         # seconds between attempts to return to the top network (0 = never)
 CHECK_URL="http://captive.apple.com/hotspot-detect.html"
 CHECK_EXPECT="Success"
+CHECK_URL2="http://connectivitycheck.gstatic.com/generate_204"   # second opinion, expects HTTP 204
+RECHECK_INTERVAL=3        # seconds between checks while the internet looks down
+WINDOW=5                  # switch when FAILS_BEFORE_SWITCH of the last WINDOW checks failed
 IFACE_OVERRIDE=""
 
 OS="$(uname -s)"
@@ -39,16 +42,19 @@ load_config() {
     case "$line" in ''|\#*) continue;; *=*) ;; *) log "config: ignoring line '$line'"; continue;; esac
     key="$(trim "${line%%=*}")"; val="$(trim "${line#*=}")"
     case "$key" in
-      check_interval|fails_before_switch|join_wait|primary_retry)
+      check_interval|fails_before_switch|join_wait|primary_retry|recheck_interval|window)
         if ! is_uint "$val"; then log "config: $key must be a whole number, got '$val'"; continue; fi
         case "$key" in
           check_interval)      CHECK_INTERVAL="$val";;
           fails_before_switch) FAILS_BEFORE_SWITCH="$val";;
           join_wait)           JOIN_WAIT="$val";;
           primary_retry)       PRIMARY_RETRY="$val";;
+          recheck_interval)    RECHECK_INTERVAL="$val";;
+          window)              WINDOW="$val";;
         esac;;
       check_url)    CHECK_URL="$val";;
       check_expect) CHECK_EXPECT="$val";;
+      check_url2)   CHECK_URL2="$val";;
       interface)    IFACE_OVERRIDE="$val";;
       prefer)
         if [[ "$val" == *"|"* ]]; then
@@ -168,12 +174,13 @@ check_deps() {
 # ---------------------------------------------------------------- core
 
 # Internet check bound to the Wi-Fi interface, so a working Ethernet link can't hide a dead Wi-Fi.
+# Both checks use hostnames on purpose: a network with broken DNS is "no internet" for the user too.
 online() {
   local ifc="$1"
-  case "$(curl -s --interface "$ifc" --max-time 5 "$CHECK_URL" 2>/dev/null)" in
+  case "$(curl -s --interface "$ifc" --max-time 4 "$CHECK_URL" 2>/dev/null)" in
     *"$CHECK_EXPECT"*) return 0 ;;
   esac
-  curl -s --interface "$ifc" --max-time 5 -o /dev/null https://1.1.1.1 2>/dev/null
+  [ "$(curl -s --interface "$ifc" --max-time 4 -o /dev/null -w '%{http_code}' "$CHECK_URL2" 2>/dev/null)" = "204" ]
 }
 
 # Fills CANDIDATES/CANDIDATE_PASS: config "prefer" entries first, then the OS's known networks, minus excludes.
@@ -241,7 +248,7 @@ cmd_run() {
   check_deps
   load_config
   log "wifihop $VERSION started on $OS (config: $CONF)"
-  local fails=0 last_primary_try now ifc cur warned_iface=0
+  local fails=0 history="" last_primary_try now ifc cur warned_iface=0
   last_primary_try="$(date +%s)"
   while true; do
     load_config
@@ -255,29 +262,45 @@ cmd_run() {
     build_candidates "$ifc"
     if [ ${#CANDIDATES[@]} -eq 0 ]; then sleep 60; continue; fi
 
+    # History of recent checks, newest last: "1" = failed, "0" = ok. A single lucky check on a
+    # flaky network doesn't wipe out earlier failures.
     if online "$ifc"; then
-      fails=0
-      cur="$(p_current "$ifc")"
-      now="$(date +%s)"
-      if [ "$PRIMARY_RETRY" -gt 0 ] && [ -n "$cur" ] && [ "$cur" != "${CANDIDATES[0]}" ] &&
-         [ $((now - last_primary_try)) -ge "$PRIMARY_RETRY" ]; then
-        last_primary_try="$now"
-        log "On backup '$cur'; checking whether '${CANDIDATES[0]}' is back"
-        join "$ifc" "${CANDIDATES[0]}" "${CANDIDATE_PASS[0]}" ||
-          join "$ifc" "$cur" "$(candidate_pass "$cur")" ||
-          failover "$ifc"
-      fi
+      [ "${history: -1}" = "1" ] && log "Internet answered on $ifc"
+      history="${history}0"
     else
-      fails=$((fails + 1))
-      log "No internet on $ifc ($fails/$FAILS_BEFORE_SWITCH)"
-      if [ $fails -ge "$FAILS_BEFORE_SWITCH" ]; then
-        failover "$ifc"
-        fails=0; last_primary_try="$(date +%s)"
-      fi
+      history="${history}1"
     fi
-    sleep "$CHECK_INTERVAL"
+    history="$(printf '%s' "$history" | tail -c "$WINDOW")"
+    fails="$(tail_fails "$history")"
+
+    if [ "${history: -1}" = "1" ]; then
+      log "No internet on $ifc ($fails of the last ${#history} checks failed; switching at $FAILS_BEFORE_SWITCH)"
+      if [ "$fails" -ge "$FAILS_BEFORE_SWITCH" ]; then
+        failover "$ifc"
+        history=""; last_primary_try="$(date +%s)"
+      fi
+      sleep "$RECHECK_INTERVAL"
+      continue
+    fi
+
+    cur="$(p_current "$ifc")"
+    now="$(date +%s)"
+    if [ "$fails" -eq 0 ] && [ "$PRIMARY_RETRY" -gt 0 ] && [ -n "$cur" ] && [ "$cur" != "${CANDIDATES[0]}" ] &&
+       [ $((now - last_primary_try)) -ge "$PRIMARY_RETRY" ]; then
+      last_primary_try="$now"
+      log "On backup '$cur'; checking whether '${CANDIDATES[0]}' is back"
+      join "$ifc" "${CANDIDATES[0]}" "${CANDIDATE_PASS[0]}" ||
+        join "$ifc" "$cur" "$(candidate_pass "$cur")" ||
+        failover "$ifc"
+      history=""
+    fi
+    # Check again soon while there were recent failures, otherwise at the normal pace.
+    if [ "$fails" -gt 0 ]; then sleep "$RECHECK_INTERVAL"; else sleep "$CHECK_INTERVAL"; fi
   done
 }
+
+# Number of failed checks ("1"s) in a history string.
+tail_fails() { local h="${1//0/}"; printf '%s' "${#h}"; }
 
 # Explains why the config might not be applied (it's root-only because it can hold passwords).
 conf_note() {

@@ -38,7 +38,7 @@ curl -fsSL https://raw.githubusercontent.com/phcodesage/wifihop/main/install.sh 
 | `--prefer SSID` | Try this network first (repeatable, in order) |
 | `--exclude SSID` | Never auto-join this network, e.g. a phone hotspot (repeatable) |
 | `--interval SECONDS` | How often to check the internet (default 10) |
-| `--fails N` | Failed checks in a row before switching (default 3) |
+| `--fails N` | Failed checks (out of the last 5) before switching (default 3) |
 | `--config FILE` | Install your own config file |
 | `--no-start` | Install everything, but don't start the service yet |
 | `--force` | Install even if no Wi-Fi interface is detected right now |
@@ -85,8 +85,8 @@ journalctl -u wifihop -f          # Linux
 
 ## How it works
 
-1. Every `check_interval` seconds it fetches a known page (Apple's captive-portal check, with `1.1.1.1` as a backup) **through the Wi-Fi interface**.
-2. After `fails_before_switch` failures in a row, it scans for networks in range and walks down the list, skipping the current network, excluded networks and networks that aren't in range.
+1. Every `check_interval` seconds it fetches a known page (Apple's captive-portal check, with Google's `generate_204` as a second opinion) **through the Wi-Fi interface**. Both use DNS on purpose, because a network with broken DNS is unusable too.
+2. As soon as a check fails, it rechecks every `recheck_interval` seconds. When `fails_before_switch` of the last `window` checks have failed (not necessarily in a row, so flaky networks are caught), it scans for networks in range and walks down the list, skipping the current network, excluded networks and networks that aren't in range.
 3. For each candidate it joins the network, then waits up to `join_wait` seconds for real internet. It stays on the first network that works.
 4. While on a backup network, it tries the top network again every `primary_retry` seconds.
 
@@ -108,7 +108,9 @@ You only need to put a password in the config for a network the machine has neve
 
 ```ini
 check_interval = 10        # seconds between internet checks
-fails_before_switch = 3    # failed checks in a row before switching
+fails_before_switch = 3    # switch when this many of the last `window` checks failed
+window = 5
+recheck_interval = 3       # seconds between checks while the internet looks down
 join_wait = 20             # seconds to wait for a new network to reach the internet
 primary_retry = 300        # how often to try returning to the top network (0 = never)
 

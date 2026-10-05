@@ -60,7 +60,7 @@ Install options:
   --prefer SSID        Try SSID before the machine's other known networks (repeatable)
   --exclude SSID       Never auto-join SSID, e.g. a phone hotspot (repeatable)
   --interval SECONDS   How often to check the internet (default 10)
-  --fails N            Failed checks in a row before switching (default 3)
+  --fails N            Failed checks (out of the last 5) before switching (default 3)
   --no-start           Install everything but don't start the service yet
   --force              Install even if no Wi-Fi interface is detected right now
 
@@ -258,8 +258,13 @@ write_default_conf() {
 # How often to test the internet, in seconds.
 check_interval = 10
 
-# How many failed tests in a row before switching networks.
+# Switch networks when this many of the last "window" tests failed.
+# (Not "in a row": a flaky network that gets through now and then still gets replaced.)
 fails_before_switch = 3
+window = 5
+
+# While the internet looks down, test again every this many seconds.
+recheck_interval = 3
 
 # How long to wait for a newly joined network to reach the internet, in seconds.
 join_wait = 20
