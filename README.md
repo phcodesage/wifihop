@@ -138,16 +138,29 @@ See [`wifihop.conf.example`](wifihop.conf.example).
 
 - **Hidden network names on macOS 15+:** macOS hides Wi-Fi names from background services. wifihop therefore scans and joins inside the logged-in user's session, where names are visible. With nobody logged in, it falls back to turning Wi-Fi off and on, which lets macOS auto-join the top known network.
 - **Turning Wi-Fi off:** if you switch Wi-Fi off, wifihop waits and does nothing until it's back on.
+- **Only one network around:** wifihop only switches when another known network is in range. If the network you're on is the only one, it leaves Wi-Fi alone and waits for it to recover. It never disconnects or restarts Wi-Fi when there's nothing better to switch to. It also waits, without disconnecting anything, when it can't scan to see what's nearby.
+- **Reconnecting:** while Wi-Fi is still connecting (no address yet), checks don't count as failures, so a normal reconnect never triggers a switch.
 - **Captive portals:** hotel and airport login pages count as "no internet", so wifihop moves on to the next network.
 
-## Uninstall
+## Stop or uninstall
+
+Stop it without removing it:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/phcodesage/wifihop/main/install.sh | sudo bash -s -- --uninstall
-# or from a clone:
-sudo ./install.sh --uninstall          # keeps /etc/wifihop.conf
-sudo ./install.sh --uninstall --purge  # removes everything
+sudo launchctl bootout system/io.github.phcodesage.wifihop   # macOS (starts again at boot)
+sudo systemctl stop wifihop                                   # Linux (starts again at boot)
+sudo systemctl disable --now wifihop                          # Linux, stays off after reboot
 ```
+
+Uninstall:
+
+```sh
+sudo ./uninstall.sh           # from the unzipped folder or a clone; keeps /etc/wifihop.conf
+sudo ./uninstall.sh --purge   # also removes the config and log
+curl -fsSL https://raw.githubusercontent.com/phcodesage/wifihop/main/uninstall.sh | sudo bash
+```
+
+The uninstaller asks before removing anything, and it never changes your Wi-Fi settings or saved networks.
 
 ## License
 

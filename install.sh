@@ -4,8 +4,7 @@
 #
 # Install from a clone:      sudo ./install.sh
 # Install straight from web: curl -fsSL https://raw.githubusercontent.com/phcodesage/wifihop/main/install.sh | sudo bash
-# Uninstall:                 sudo ./install.sh --uninstall   (add --purge to also delete the config)
-#                            curl -fsSL https://raw.githubusercontent.com/phcodesage/wifihop/main/install.sh | sudo bash -s -- --uninstall
+# Uninstall:                 sudo ./uninstall.sh   (or: sudo ./install.sh --uninstall)
 #
 # Run ./install.sh --help for every option.
 
@@ -426,5 +425,6 @@ starts automatically at every boot, and restarts itself if it ever stops.
   $LOGCMD
   sudo nano $CONF   change the order, exclude networks, add passwords
 
-  Uninstall:  $([ -n "$SRC_DIR" ] && echo "sudo $SRC_DIR/install.sh --uninstall" || echo "curl -fsSL $RAW_URL/install.sh | sudo bash -s -- --uninstall")
+  Stop it:    $([ "$OS" = Darwin ] && echo "sudo launchctl bootout system/$MAC_LABEL" || echo "sudo systemctl stop wifihop")   (starts again at boot)
+  Uninstall:  $([ -n "$SRC_DIR" ] && [ -f "$SRC_DIR/uninstall.sh" ] && echo "sudo $SRC_DIR/uninstall.sh" || echo "curl -fsSL $RAW_URL/uninstall.sh | sudo bash")
 EOF
